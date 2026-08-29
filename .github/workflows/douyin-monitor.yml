@@ -1,10 +1,9 @@
 name: Douyin new-work monitor
 
 on:
-  # GitHub cron uses UTC. This schedule is the closest cron expression to
-  # "每 25 分钟": 00, 25, 50 分钟触发（每小时边界处会有 10 分钟间隔）。
+  # GitHub cron uses UTC. Run the monitor every 10 minutes.
   schedule:
-    - cron: "0,25,50 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
