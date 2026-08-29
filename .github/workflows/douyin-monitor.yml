@@ -1,0 +1,73 @@
+name: Douyin new-work monitor
+
+on:
+  # GitHub cron uses UTC. This schedule is the closest cron expression to
+  # "每 25 分钟": 00, 25, 50 分钟触发（每小时边界处会有 10 分钟间隔）。
+  schedule:
+    - cron: "0,25,50 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: douyin-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # The profile URL is already the default in monitor.py. It can be
+      # overridden here or in a repository variable without changing code.
+      DOUYIN_USER_URL: ${{ vars.DOUYIN_USER_URL }}
+      DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
+      SMTP_HOST: ${{ vars.SMTP_HOST }}
+      SMTP_PORT: ${{ vars.SMTP_PORT }}
+      SMTP_USE_SSL: ${{ vars.SMTP_USE_SSL }}
+      SMTP_STARTTLS: ${{ vars.SMTP_STARTTLS }}
+      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      SMTP_FROM: ${{ secrets.SMTP_FROM }}
+      SMTP_TO: ${{ secrets.SMTP_TO }}
+      # Set to true only if the first run should email all works currently
+      # visible on the profile. The default is false (baseline only).
+      NOTIFY_ON_FIRST_RUN: ${{ vars.NOTIFY_ON_FIRST_RUN }}
+      PUBLISHED_TIMEZONE: ${{ vars.PUBLISHED_TIMEZONE }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: douyin/requirements.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install -r douyin/requirements.txt
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Check creator works
+        run: python douyin/monitor.py
+
+      - name: Persist monitor state
+        if: success()
+        shell: bash
+        run: |
+          if ! git status --porcelain -- douyin/state.json | grep -q .; then
+            echo "No state change to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add douyin/state.json
+          git commit -m "chore: update Douyin monitor state [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
