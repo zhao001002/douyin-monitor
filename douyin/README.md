@@ -18,13 +18,15 @@
 在当前 Windows PowerShell 中可以这样操作（把远程地址替换成你自己的仓库地址）：
 
 ```powershell
-cd "C:\Users\77035\Desktop\Claude code"
+Set-Location -LiteralPath "C:\Users\77035\Desktop\Claude code"
 git init -b main
 git add douyin .github
 git commit -m "feat: add Douyin monitor"
 git remote add origin "https://github.com/<你的用户名>/douyin-monitor.git"
 git push -u origin main
 ```
+
+PowerShell 请一行一行执行，每执行一行后确认出现新的 `PS ...>` 提示符；不要把 `>>` 也输入进去。若提示符变成单独一行的 `>>`，说明上一条命令没有结束，先按 `Ctrl+C` 取消，再重新执行。建议先执行 `Get-Location` 确认当前路径，再执行后续 Git 命令。截图中如果已经显示 `On branch main`，说明仓库已经初始化，不需要再次执行 `git init`。
 
 如果本地已经配置过 `origin`，不要重复执行 `git remote add origin`；先用 `git remote -v` 查看即可。工作流文件必须位于仓库根目录的 `.github/workflows/`，不能放在 `douyin/.github/`，否则 GitHub 不会将它识别为 Actions 工作流。
 
