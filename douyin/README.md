@@ -10,10 +10,10 @@
 
 ### 1. 创建 GitHub 仓库
 
-建议在 GitHub 新建一个单独的仓库，例如 `douyin-monitor`。如果当前工作区还包含其他项目，不要使用 `git add .`，否则可能把无关文件一并上传；只提交下面的两个路径：
+建议在 GitHub 新建一个单独的仓库，例如 `douyin-monitor`。如果当前工作区还包含其他项目，不要使用 `git add .`，否则可能把无关文件一并上传；只提交下面的路径：
 
 - `douyin/`
-- `.github/workflows/douyin-monitor.yml`
+- `.github/workflows/`
 
 在当前 Windows PowerShell 中可以这样操作（把远程地址替换成你自己的仓库地址）：
 
@@ -123,6 +123,43 @@ PowerShell 请一行一行执行，每执行一行后确认出现新的 `PS ...>
 ### 7. 等待自动检查
 
 工作流使用 `0,25,50 * * * *`，按 UTC 的每小时第 00、25、50 分钟运行。中国大陆时间是 UTC+8，例如 UTC 00:00 对应北京时间 08:00。GitHub 的定时任务可能因平台负载延迟几分钟，而且标准 cron 在每小时边界无法保持严格的 25 分钟间隔，所以 50 分钟到下一小时 00 分钟之间会有一次 10 分钟间隔。
+
+## 导出历史作品详细信息
+
+项目另外提供了一个只手动运行的工作流，用于抓取该博主目前可以公开访问的历史作品。每条记录包含：作品名称、发布时间、链接、点赞、评论、分享；同时额外保存作品 ID，方便去重和核对。
+
+### 在 GitHub Actions 中导出
+
+1. 打开仓库的 `Actions` 标签。
+2. 左侧点击 `Douyin history export`。
+3. 点击右侧 `Run workflow`，保持 `main` 分支。
+4. `max_pages` 保持默认 `100`，`max_items` 保持默认 `5000`，然后点击运行。
+5. 等待工作流成功。
+
+成功后有两种获取方式：
+
+- 在仓库的 `Code` 页面打开 `douyin/history/history.csv`，点击下载后用 Excel 打开。CSV 使用 UTF-8 BOM 编码，中文不会乱码。
+- 打开本次运行页面，在 `Artifacts` 下载 `douyin-history` 压缩包，其中包含 `history.csv` 和 `history.json`。
+
+CSV 的列顺序是：`作品ID`、`作品名称`、`发布时间`、`链接`、`点赞`、`评论`、`分享`。抖音接口没有独立的“标题”字段，因此“作品名称”使用作品文案（`desc`）；没有文字文案的作品会显示“该作品没有文字描述”。如果某项数据没有被抖音接口返回，对应单元格会留空。
+
+这个导出工作流不会发送邮件，也不会修改新作品通知使用的 `douyin/state.json`。默认最多抓取 100 页、5000 个作品；如果日志提示达到上限，可以在运行时提高这两个输入值。若匿名访问被抖音拦截，按上面的 Cookie 兜底配置添加 `DOUYIN_COOKIE` 后再运行。
+
+### 本地导出
+
+在仓库根目录执行：
+
+```powershell
+python douyin/monitor.py --export-history --output-dir douyin/history
+```
+
+也可以使用临时输出目录，避免覆盖仓库里的导出文件：
+
+```powershell
+python douyin/monitor.py --export-history --output-dir C:\Temp\douyin-history
+```
+
+本地导出同样需要先安装 `douyin/requirements.txt` 中的依赖和 Chromium。历史抓取的可选环境变量为 `DOUYIN_HISTORY_MAX_PAGES`、`DOUYIN_HISTORY_MAX_ITEMS`、`DOUYIN_HISTORY_PAGE_SIZE` 和 `DOUYIN_HISTORY_PAGE_DELAY_MS`。
 
 ## 抖音 Cookie 兜底配置
 

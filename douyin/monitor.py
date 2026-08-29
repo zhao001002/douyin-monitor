@@ -7,14 +7,17 @@ free of hard-coded signature algorithms that change frequently.
 
 The state file is intentionally small and is committed by the GitHub Actions
 workflow after a successful check.  A first run creates a baseline and does
-not send an email unless NOTIFY_ON_FIRST_RUN is enabled.
+not send an email unless NOTIFY_ON_FIRST_RUN is enabled.  The same script can
+also paginate the public works endpoint and export history.csv/history.json.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import html
+import io
 import json
 import logging
 import os
@@ -78,6 +81,11 @@ class MonitorConfig:
     sec_user_id: str
     state_file: Path
     max_items: int
+    history_page_size: int
+    history_max_pages: int
+    history_max_items: int
+    history_page_delay_ms: int
+    history_output_dir: Path
     max_seen: int
     page_wait_ms: int
     navigation_timeout_ms: int
@@ -140,12 +148,29 @@ def build_config(args: argparse.Namespace) -> MonitorConfig:
     state_file = Path(raw_state_file) if raw_state_file else DEFAULT_STATE_FILE
     if not state_file.is_absolute():
         state_file = Path.cwd() / state_file
+    raw_history_output_dir = getattr(args, "output_dir", None) or env_text(
+        "DOUYIN_HISTORY_OUTPUT_DIR"
+    )
+    history_output_dir = (
+        Path(raw_history_output_dir)
+        if raw_history_output_dir
+        else Path(__file__).with_name("history")
+    )
+    if not history_output_dir.is_absolute():
+        history_output_dir = Path.cwd() / history_output_dir
 
     return MonitorConfig(
         user_url=user_url,
         sec_user_id=sec_user_id,
         state_file=state_file,
         max_items=env_int("DOUYIN_MAX_ITEMS", 30, minimum=1),
+        history_page_size=env_int("DOUYIN_HISTORY_PAGE_SIZE", 30, minimum=1),
+        history_max_pages=env_int("DOUYIN_HISTORY_MAX_PAGES", 100, minimum=1),
+        history_max_items=env_int("DOUYIN_HISTORY_MAX_ITEMS", 5000, minimum=1),
+        history_page_delay_ms=env_int(
+            "DOUYIN_HISTORY_PAGE_DELAY_MS", 300, minimum=0
+        ),
+        history_output_dir=history_output_dir,
         max_seen=env_int("DOUYIN_MAX_SEEN", 500, minimum=20),
         page_wait_ms=env_int("DOUYIN_PAGE_WAIT_MS", 4000, minimum=0),
         navigation_timeout_ms=env_int("DOUYIN_NAVIGATION_TIMEOUT_MS", 60000, minimum=1000),
@@ -307,7 +332,150 @@ async ({ secUserId, count }) => {
 """
 
 
-async def fetch_works_once(config: MonitorConfig) -> list[Work]:
+# This is intentionally a separate page function from FETCH_WORKS_IN_PAGE.
+# It keeps the pagination loop inside the browser page so every request goes
+# through Douyin's current runtime/signature handling.
+FETCH_HISTORY_IN_PAGE = r"""
+async ({ secUserId, pageSize, maxPages, maxItems, pageDelayMs }) => {
+  const items = [];
+  const seenIds = new Set();
+  let maxCursor = 0;
+  let hasMore = true;
+  let pages = 0;
+  let lastHttpStatus = null;
+  let lastResponseUrl = '';
+
+  const normalizeItems = list => list.map(item => {
+    // Prefer *_str fields: a 19-digit aweme_id must not pass through a JS
+    // number, otherwise its precision could be lost before Python sees it.
+    const awemeId = String(item.aweme_id_str || item.aweme_id || '');
+    if (!awemeId) return null;
+    const statistics = item.statistics || {};
+    const shareUrl = item.share_info && item.share_info.share_url;
+    return {
+      aweme_id: awemeId,
+      description: String(item.desc || ''),
+      create_time: Number(item.create_time || 0),
+      url: typeof shareUrl === 'string' && shareUrl.includes('/video/')
+        ? shareUrl
+        : `https://www.douyin.com/video/${awemeId}`,
+      nickname: String((item.author && item.author.nickname) || ''),
+      is_top: Boolean(item.is_top || item.is_pinned || item.aweme_control?.is_top),
+      digg_count: statistics.digg_count,
+      comment_count: statistics.comment_count,
+      share_count: statistics.share_count
+    };
+  }).filter(Boolean);
+
+  while (hasMore && pages < maxPages && items.length < maxItems) {
+    const endpoint = new URL('/aweme/v1/web/aweme/post/', location.origin);
+    const params = {
+      device_platform: 'webapp',
+      aid: '6383',
+      channel: 'channel_pc_web',
+      sec_user_id: secUserId,
+      max_cursor: String(maxCursor),
+      count: String(pageSize),
+      locate_query: 'false',
+      show_live_replay_strategy: '1',
+      need_time_list: '1',
+      time_list_query: '0',
+      whale_cut_token: '',
+      cut_version: '1',
+      publish_video_strategy_type: '2',
+      from_user_page: '1',
+      update_version_code: '170400',
+      pc_client_type: '1'
+    };
+    for (const [key, value] of Object.entries(params)) {
+      endpoint.searchParams.set(key, value);
+    }
+
+    const response = await fetch(endpoint.toString(), {
+      credentials: 'include',
+      headers: { accept: 'application/json, text/plain, */*' }
+    });
+    const text = await response.text();
+    lastHttpStatus = response.status;
+    lastResponseUrl = response.url;
+    if (!text.trim()) {
+      return {
+        http_status: response.status,
+        response_url: response.url,
+        body: '',
+        page: pages + 1
+      };
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch (error) {
+      return {
+        http_status: response.status,
+        response_url: response.url,
+        body: text.slice(0, 500),
+        parse_error: String(error),
+        page: pages + 1
+      };
+    }
+
+    if (payload.status_code !== undefined && payload.status_code !== 0 && payload.status_code !== '0') {
+      return {
+        http_status: response.status,
+        response_url: response.url,
+        status_code: payload.status_code,
+        page: pages + 1,
+        body: text.slice(0, 500)
+      };
+    }
+
+    const list = Array.isArray(payload.aweme_list) ? payload.aweme_list : [];
+    for (const item of normalizeItems(list)) {
+      if (!seenIds.has(item.aweme_id)) {
+        seenIds.add(item.aweme_id);
+        items.push(item);
+        if (items.length >= maxItems) break;
+      }
+    }
+
+    pages += 1;
+    hasMore = Boolean(payload.has_more);
+    const nextCursor = payload.max_cursor;
+    if (
+      !hasMore ||
+      nextCursor === undefined ||
+      nextCursor === null ||
+      String(nextCursor) === String(maxCursor)
+    ) {
+      hasMore = false;
+      break;
+    }
+    maxCursor = nextCursor;
+    if (pageDelayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, pageDelayMs));
+    }
+  }
+
+  return {
+    http_status: lastHttpStatus,
+    response_url: lastResponseUrl,
+    status_code: 0,
+    pages,
+    has_more: hasMore,
+    items
+  };
+}
+"""
+
+
+async def evaluate_on_douyin_page(
+    config: MonitorConfig,
+    script: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Load the profile once and evaluate a page-context Douyin query."""
+
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True,
@@ -343,40 +511,57 @@ async def fetch_works_once(config: MonitorConfig) -> list[Work]:
                 if config.page_wait_ms:
                     await page.wait_for_timeout(config.page_wait_ms)
 
-                result = await page.evaluate(
-                    FETCH_WORKS_IN_PAGE,
-                    {"secUserId": config.sec_user_id, "count": config.max_items},
-                )
+                result = await page.evaluate(script, payload)
                 if not isinstance(result, dict):
                     raise DouyinFetchError("抖音作品接口返回了无法识别的数据")
-
-                http_status = result.get("http_status")
-                body = str(result.get("body") or "").strip()
-                if not body and "items" not in result:
-                    raise DouyinFetchError(
-                        "抖音作品接口返回空响应；请稍后重试，或配置最新的 DOUYIN_COOKIE"
-                    )
-                if result.get("parse_error"):
-                    raise DouyinFetchError("抖音作品接口返回的内容不是有效 JSON")
-                if http_status != 200:
-                    raise DouyinFetchError(f"抖音作品接口 HTTP 状态异常：{http_status}")
-                if result.get("status_code") not in (None, 0, "0"):
-                    raise DouyinFetchError(
-                        f"抖音作品接口返回 status_code={result.get('status_code')}"
-                    )
-
-                works: list[Work] = []
-                for raw in result.get("items") or []:
-                    if isinstance(raw, dict):
-                        work = normalize_work(raw)
-                        if work:
-                            works.append(work)
-                LOGGER.info("本次读取到 %d 个作品。", len(works))
-                return works
+                return result
             finally:
                 await context.close()
         finally:
             await browser.close()
+
+
+def validate_fetch_result(result: dict[str, Any]) -> None:
+    http_status = result.get("http_status")
+    body = str(result.get("body") or "").strip()
+    if not body and "items" not in result:
+        page = result.get("page")
+        suffix = f"（第 {page} 页）" if page else ""
+        raise DouyinFetchError(
+            f"抖音作品接口返回空响应{suffix}；请稍后重试，或配置最新的 DOUYIN_COOKIE"
+        )
+    if result.get("parse_error"):
+        page = result.get("page")
+        suffix = f"（第 {page} 页）" if page else ""
+        raise DouyinFetchError(f"抖音作品接口返回的内容不是有效 JSON{suffix}")
+    if http_status != 200:
+        page = result.get("page")
+        suffix = f"（第 {page} 页）" if page else ""
+        raise DouyinFetchError(f"抖音作品接口 HTTP 状态异常{suffix}：{http_status}")
+    if result.get("status_code") not in (None, 0, "0"):
+        page = result.get("page")
+        suffix = f"（第 {page} 页）" if page else ""
+        raise DouyinFetchError(
+            f"抖音作品接口返回 status_code={result.get('status_code')}{suffix}"
+        )
+
+
+async def fetch_works_once(config: MonitorConfig) -> list[Work]:
+    result = await evaluate_on_douyin_page(
+        config,
+        FETCH_WORKS_IN_PAGE,
+        {"secUserId": config.sec_user_id, "count": config.max_items},
+    )
+    validate_fetch_result(result)
+
+    works: list[Work] = []
+    for raw in result.get("items") or []:
+        if isinstance(raw, dict):
+            work = normalize_work(raw)
+            if work:
+                works.append(work)
+    LOGGER.info("本次读取到 %d 个作品。", len(works))
+    return works
 
 
 async def fetch_works(config: MonitorConfig) -> list[Work]:
@@ -390,6 +575,53 @@ async def fetch_works(config: MonitorConfig) -> list[Work]:
             if attempt < config.fetch_retries:
                 await asyncio.sleep(min(10, attempt * 3))
     raise MonitorError(f"连续 {config.fetch_retries} 次抓取抖音失败：{last_error}") from last_error
+
+
+async def fetch_history_once(config: MonitorConfig) -> list[Work]:
+    result = await evaluate_on_douyin_page(
+        config,
+        FETCH_HISTORY_IN_PAGE,
+        {
+            "secUserId": config.sec_user_id,
+            "pageSize": config.history_page_size,
+            "maxPages": config.history_max_pages,
+            "maxItems": config.history_max_items,
+            "pageDelayMs": config.history_page_delay_ms,
+        },
+    )
+    validate_fetch_result(result)
+
+    works: list[Work] = []
+    for raw in result.get("items") or []:
+        if isinstance(raw, dict):
+            work = normalize_work(raw)
+            if work:
+                works.append(work)
+
+    pages = result.get("pages") or 0
+    if result.get("has_more"):
+        LOGGER.warning(
+            "历史作品导出达到上限：已抓取 %s 页、%d 个作品；"
+            "如需继续，请提高 DOUYIN_HISTORY_MAX_PAGES 或 DOUYIN_HISTORY_MAX_ITEMS。",
+            pages,
+            len(works),
+        )
+    else:
+        LOGGER.info("历史作品抓取完成：%s 页，共 %d 个作品。", pages, len(works))
+    return works
+
+
+async def fetch_history(config: MonitorConfig) -> list[Work]:
+    last_error: Exception | None = None
+    for attempt in range(1, config.fetch_retries + 1):
+        try:
+            return await fetch_history_once(config)
+        except Exception as exc:  # retry browser/network failures as one unit
+            last_error = exc
+            LOGGER.warning("第 %d/%d 次历史抓取失败：%s", attempt, config.fetch_retries, exc)
+            if attempt < config.fetch_retries:
+                await asyncio.sleep(min(10, attempt * 3))
+    raise MonitorError(f"连续 {config.fetch_retries} 次抓取抖音历史作品失败：{last_error}") from last_error
 
 
 def load_state(path: Path, sec_user_id: str) -> tuple[bool, list[str]]:
@@ -463,6 +695,76 @@ def clean_header_text(value: str) -> str:
 
 def display_description(work: Work) -> str:
     return work.description or "（该作品没有文字描述）"
+
+
+HISTORY_CSV_FIELDS = (
+    "作品ID",
+    "作品名称",
+    "发布时间",
+    "链接",
+    "点赞",
+    "评论",
+    "分享",
+)
+
+
+def history_record(work: Work, timezone_name: str) -> dict[str, Any]:
+    """Return one human-readable history row shared by CSV and JSON export."""
+
+    return {
+        "作品ID": work.aweme_id,
+        # Douyin has no separate title field in this endpoint; desc is the
+        # text shown as the work's title/description on the creator page.
+        "作品名称": display_description(work),
+        "发布时间": format_publish_time(work.create_time, timezone_name),
+        "链接": work.url,
+        "点赞": work.digg_count if work.digg_count is not None else "",
+        "评论": work.comment_count if work.comment_count is not None else "",
+        "分享": work.share_count if work.share_count is not None else "",
+    }
+
+
+def atomic_write_text(path: Path, content: str, *, encoding: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(content, encoding=encoding)
+    temporary.replace(path)
+
+
+def write_history_exports(
+    works: Iterable[Work],
+    output_dir: Path,
+    timezone_name: str,
+) -> tuple[Path, Path]:
+    """Write Excel-friendly CSV and a UTF-8 JSON backup of the works."""
+
+    ordered_works = sorted(
+        works,
+        key=lambda item: (item.create_time, item.aweme_id),
+        reverse=True,
+    )
+    records = [history_record(work, timezone_name) for work in ordered_works]
+
+    csv_buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        csv_buffer,
+        fieldnames=list(HISTORY_CSV_FIELDS),
+        extrasaction="ignore",
+    )
+    writer.writeheader()
+    writer.writerows(records)
+
+    csv_path = output_dir / "history.csv"
+    json_path = output_dir / "history.json"
+    atomic_write_text(csv_path, csv_buffer.getvalue(), encoding="utf-8-sig")
+    atomic_write_text(
+        json_path,
+        json.dumps(records, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    LOGGER.info("已写入历史作品 CSV：%s。", csv_path)
+    LOGGER.info("已写入历史作品 JSON：%s。", json_path)
+    return csv_path, json_path
 
 
 def render_email(
@@ -579,15 +881,37 @@ def send_email(works: list[Work], config: MonitorConfig) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="检查抖音博主新作品并发送 SMTP 邮件")
+    parser = argparse.ArgumentParser(
+        description="检查抖音博主新作品并发送 SMTP 邮件，或导出历史作品"
+    )
     parser.add_argument("--user-url", help="覆盖 DOUYIN_USER_URL")
     parser.add_argument("--state-file", help="覆盖 DOUYIN_STATE_FILE")
+    parser.add_argument(
+        "--export-history",
+        action="store_true",
+        help="分页抓取历史作品并写入 CSV/JSON，不发送邮件也不修改监控状态",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="历史导出目录（默认 douyin/history，或使用 DOUYIN_HISTORY_OUTPUT_DIR）",
+    )
     parser.add_argument(
         "--notify-on-first-run",
         action="store_true",
         help="首次运行也发送当前作品（默认只建立基线）",
     )
     return parser.parse_args()
+
+
+async def export_history(config: MonitorConfig) -> int:
+    works = await fetch_history(config)
+    write_history_exports(
+        works,
+        config.history_output_dir,
+        config.published_timezone,
+    )
+    LOGGER.info("历史作品导出完成，共 %d 个作品。", len(works))
+    return 0
 
 
 async def run(config: MonitorConfig) -> int:
@@ -627,7 +951,11 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     try:
-        config = build_config(parse_args())
+        args = parse_args()
+        config = build_config(args)
+        if args.export_history:
+            LOGGER.info("开始导出 sec_user_id=%s 的历史作品。", config.sec_user_id)
+            return asyncio.run(export_history(config))
         LOGGER.info("开始检查 sec_user_id=%s。", config.sec_user_id)
         return asyncio.run(run(config))
     except KeyboardInterrupt:
