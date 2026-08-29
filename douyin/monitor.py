@@ -88,7 +88,8 @@ class MonitorConfig:
 
 
 def env_text(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+    value = os.environ.get(name, "").strip()
+    return value if value else default
 
 
 def env_int(name: str, default: int, *, minimum: int = 0) -> int:
